@@ -102,17 +102,32 @@ func maskOrEmpty(v string) string {
 	return v[:4] + "..." + v[len(v)-4:]
 }
 
+// resolveEnv returns the value of the first non-empty environment variable from the given names.
+func resolveEnv(names ...string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // resolveCredentials returns the path to the credentials file, or "" for ADC.
 func resolveCredentials() (string, error) {
-	// 1. GOOGLE_APPLICATION_CREDENTIALS (standard Google env var)
-	if v := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); v != "" {
+	// 1. Try all credentials file env var aliases.
+	if v := resolveEnv(
+		"GOOGLE_APPLICATION_CREDENTIALS",
+		"GSHEETS_CREDENTIALS",
+		"GOOGLE_CREDENTIALS",
+		"GCP_APPLICATION_CREDENTIALS",
+		"GCP_CREDENTIALS",
+		"GOOGLE_SERVICE_ACCOUNT_FILE",
+		"GSHEETS_SA_FILE",
+		"GCLOUD_CREDENTIALS",
+	); v != "" {
 		return v, nil
 	}
-	// 2. GSHEETS_CREDENTIALS env var
-	if v := os.Getenv("GSHEETS_CREDENTIALS"); v != "" {
-		return v, nil
-	}
-	// 3. Config file
+	// 2. Config file
 	var err error
 	cfg, err = config.Load()
 	if err != nil {
@@ -121,7 +136,7 @@ func resolveCredentials() (string, error) {
 	if cfg.CredentialsFile != "" {
 		return cfg.CredentialsFile, nil
 	}
-	// 4. Fall through to ADC (Application Default Credentials)
+	// 3. Fall through to ADC (Application Default Credentials)
 	// This works when GOOGLE_APPLICATION_CREDENTIALS is set at OS level,
 	// or after running: gcloud auth application-default login
 	return "", nil
