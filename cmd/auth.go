@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -32,23 +33,26 @@ var authCmd = &cobra.Command{
 }
 
 var authLoginNoBrowser bool
+var authLoginClientSecretFile string
 
 var authLoginCmd = &cobra.Command{
 	Use:   "login",
 	Short: "Log in to Google Sheets via browser OAuth 2.0",
 	Long: `Opens your browser to authenticate with Google and saves the credentials.
 
-Requires GSHEETS_CLIENT_ID and GSHEETS_CLIENT_SECRET environment variables.
+Client credentials (client_id + client_secret) are resolved in order:
+  1. GSHEETS_CLIENT_ID + GSHEETS_CLIENT_SECRET env vars
+  2. Config (set with: gsheets auth set-client-secret)
+  3. GSHEETS_CLIENT_SECRET_FILE env var (path to client_secret.json)
+  4. --client-secret-file flag
+  5. Default path: $XDG_CONFIG_HOME/google/client_secret.json
+     (Linux: ~/.config/google/client_secret.json, macOS: ~/Library/Application Support/google/client_secret.json)
+
 Create OAuth 2.0 credentials at: https://console.cloud.google.com/apis/credentials
 Choose "Desktop application" as the application type.
-Add http://localhost:8080 as an authorized redirect URI.
 
 On a remote server (VPS) where no browser is available:
-  gsheets auth login --no-browser
-
-  This prints the auth URL for you to open locally. After authorizing, your
-  browser will redirect to localhost:8080 (which will fail to load — that's ok).
-  Copy the full URL from the address bar and paste it into the terminal.`,
+  gsheets auth login --no-browser`,
 	RunE: runAuthLogin,
 }
 
@@ -81,6 +85,46 @@ You can also set GSHEETS_ACCESS_TOKEN as an env var for one-off use.`,
 		}
 		fmt.Printf("Token saved — authenticated as %s (%s)\n", name, email)
 		fmt.Printf("Config: %s\n", config.Path())
+		return nil
+	},
+}
+
+var authSetClientSecretCmd = &cobra.Command{
+	Use:   "set-client-secret <path-to-client_secret.json>",
+	Short: "Save the path to a client_secret.json file for OAuth 2.0 login",
+	Long: `Save the path to a Google OAuth 2.0 client_secret.json file.
+
+Download client_secret.json from:
+  https://console.cloud.google.com/apis/credentials
+Choose "Desktop application" as the application type.
+
+Once set, you can log in without any env vars:
+  gsheets auth login
+
+Default lookup path (used automatically if the file exists):
+  Linux:   ~/.config/google/client_secret.json
+  macOS:   ~/Library/Application Support/google/client_secret.json`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := args[0]
+		if _, err := os.Stat(path); err != nil {
+			return fmt.Errorf("file not found: %s", path)
+		}
+		// Verify the file is parseable
+		if _, _, err := loadClientSecretFile(path); err != nil {
+			return fmt.Errorf("invalid client_secret.json: %w", err)
+		}
+		c, err := config.Load()
+		if err != nil {
+			return fmt.Errorf("loading config: %w", err)
+		}
+		c.ClientSecretFile = path
+		if err := config.Save(c); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+		fmt.Printf("client_secret.json path saved to %s\n", config.Path())
+		fmt.Printf("File: %s\n", path)
+		fmt.Printf("\nRun: gsheets auth login\n")
 		return nil
 	},
 }
@@ -154,6 +198,20 @@ var authStatusCmd = &cobra.Command{
 			fmt.Println("Status: not authenticated")
 			fmt.Printf("\nRun: gsheets auth login\nOr:  export GSHEETS_ACCESS_TOKEN=<token>\nOr:  gsheets auth set-credentials /path/to/sa.json\n")
 		}
+
+		// Show OAuth client credential source
+		fmt.Println()
+		clientID, _, src, _ := resolveClientCredentials("")
+		if clientID != "" {
+			fmt.Printf("OAuth client:     %s (%s)\n", maskOrEmpty(clientID), src)
+		} else {
+			fmt.Printf("OAuth client:     (not configured)\n")
+			fmt.Printf("  Set via: export GSHEETS_CLIENT_ID=...\n")
+			fmt.Printf("  Or:      gsheets auth set-client-secret /path/to/client_secret.json\n")
+			if def := defaultClientSecretPath(); def != "" {
+				fmt.Printf("  Default: %s\n", def)
+			}
+		}
 		return nil
 	},
 }
@@ -172,32 +230,17 @@ var authLogoutCmd = &cobra.Command{
 
 func init() {
 	authLoginCmd.Flags().BoolVar(&authLoginNoBrowser, "no-browser", false, "Manual auth flow for remote/VPS: print the URL, prompt for the redirect URL")
-	authCmd.AddCommand(authLoginCmd, authSetTokenCmd, authSetCredentialsCmd, authStatusCmd, authLogoutCmd)
+	authLoginCmd.Flags().StringVar(&authLoginClientSecretFile, "client-secret-file", "", "Path to client_secret.json (overrides default lookup)")
+	authCmd.AddCommand(authLoginCmd, authSetTokenCmd, authSetClientSecretCmd, authSetCredentialsCmd, authStatusCmd, authLogoutCmd)
 	rootCmd.AddCommand(authCmd)
 }
 
 func runAuthLogin(cmd *cobra.Command, args []string) error {
-	clientID := os.Getenv("GSHEETS_CLIENT_ID")
-	clientSecret := os.Getenv("GSHEETS_CLIENT_SECRET")
-
-	// Fall back to stored config
-	if clientID == "" || clientSecret == "" {
-		if c, err := config.Load(); err == nil && c != nil {
-			if clientID == "" {
-				clientID = c.ClientID
-			}
-			if clientSecret == "" {
-				clientSecret = c.ClientSecret
-			}
-		}
+	clientID, clientSecret, src, err := resolveClientCredentials(authLoginClientSecretFile)
+	if err != nil {
+		return fmt.Errorf("no OAuth client credentials found\n\n%w\n\nCreate credentials at: https://console.cloud.google.com/apis/credentials\nThen set: export GSHEETS_CLIENT_ID=... GSHEETS_CLIENT_SECRET=...\nOr:       gsheets auth set-client-secret /path/to/client_secret.json", err)
 	}
-
-	if clientID == "" {
-		return fmt.Errorf("GSHEETS_CLIENT_ID not set\n\nCreate credentials at: https://console.cloud.google.com/apis/credentials\nThen: export GSHEETS_CLIENT_ID=<your-client-id>")
-	}
-	if clientSecret == "" {
-		return fmt.Errorf("GSHEETS_CLIENT_SECRET not set\n\nexport GSHEETS_CLIENT_SECRET=<your-client-secret>")
-	}
+	fmt.Printf("Using client credentials from: %s\n", src)
 
 	var code string
 	var redirectURI string
@@ -300,6 +343,112 @@ func runAuthLogin(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Auto-refresh: enabled\n")
 	fmt.Printf("Config saved to: %s\n", config.Path())
 	return nil
+}
+
+// clientSecretJSON is the structure of a Google OAuth 2.0 client_secret.json file.
+type clientSecretJSON struct {
+	Installed *clientSecretApp `json:"installed"`
+	Web       *clientSecretApp `json:"web"`
+}
+
+type clientSecretApp struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+// loadClientSecretFile parses a client_secret.json and returns clientID, clientSecret.
+func loadClientSecretFile(path string) (string, string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	var f clientSecretJSON
+	if err := json.Unmarshal(data, &f); err != nil {
+		return "", "", fmt.Errorf("parsing client_secret.json: %w", err)
+	}
+	app := f.Installed
+	if app == nil {
+		app = f.Web
+	}
+	if app == nil {
+		return "", "", fmt.Errorf("no 'installed' or 'web' section in %s", path)
+	}
+	if app.ClientID == "" || app.ClientSecret == "" {
+		return "", "", fmt.Errorf("missing client_id or client_secret in %s", path)
+	}
+	return app.ClientID, app.ClientSecret, nil
+}
+
+// defaultClientSecretPath returns the OS-specific default path for client_secret.json.
+func defaultClientSecretPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "google", "client_secret.json")
+}
+
+// resolveClientCredentials returns clientID, clientSecret, source description, and error.
+// flagFile is the value of --client-secret-file flag (may be empty).
+// Resolution order:
+//  1. GSHEETS_CLIENT_ID + GSHEETS_CLIENT_SECRET env vars
+//  2. Config stored ClientID + ClientSecret
+//  3. GSHEETS_CLIENT_SECRET_FILE env var → parse file
+//  4. flagFile (--client-secret-file flag) → parse file
+//  5. Config ClientSecretFile → parse file
+//  6. Default path $UserConfigDir/google/client_secret.json (if exists)
+func resolveClientCredentials(flagFile string) (clientID, clientSecret, source string, err error) {
+	// 1. Direct env vars
+	clientID = os.Getenv("GSHEETS_CLIENT_ID")
+	clientSecret = os.Getenv("GSHEETS_CLIENT_SECRET")
+	if clientID != "" && clientSecret != "" {
+		return clientID, clientSecret, "env vars (GSHEETS_CLIENT_ID / GSHEETS_CLIENT_SECRET)", nil
+	}
+
+	// 2. Config stored values
+	if c, err2 := config.Load(); err2 == nil && c != nil {
+		if clientID == "" {
+			clientID = c.ClientID
+		}
+		if clientSecret == "" {
+			clientSecret = c.ClientSecret
+		}
+		if clientID != "" && clientSecret != "" {
+			return clientID, clientSecret, "config file (stored credentials)", nil
+		}
+
+		// 3. GSHEETS_CLIENT_SECRET_FILE env var
+		if path := os.Getenv("GSHEETS_CLIENT_SECRET_FILE"); path != "" {
+			if id, sec, err2 := loadClientSecretFile(path); err2 == nil {
+				return id, sec, "GSHEETS_CLIENT_SECRET_FILE → " + path, nil
+			}
+		}
+
+		// 4. --client-secret-file flag
+		if flagFile != "" {
+			if id, sec, err2 := loadClientSecretFile(flagFile); err2 == nil {
+				return id, sec, "--client-secret-file → " + flagFile, nil
+			}
+		}
+
+		// 5. Config ClientSecretFile
+		if c.ClientSecretFile != "" {
+			if id, sec, err2 := loadClientSecretFile(c.ClientSecretFile); err2 == nil {
+				return id, sec, "config client_secret_file → " + c.ClientSecretFile, nil
+			}
+		}
+	}
+
+	// 6. Default path
+	if def := defaultClientSecretPath(); def != "" {
+		if _, statErr := os.Stat(def); statErr == nil {
+			if id, sec, err2 := loadClientSecretFile(def); err2 == nil {
+				return id, sec, "default path → " + def, nil
+			}
+		}
+	}
+
+	return "", "", "", fmt.Errorf("no client credentials found")
 }
 
 func runOAuthFlowManual(authURL string) (string, error) {

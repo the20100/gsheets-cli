@@ -37,9 +37,23 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
 
 ### User Account (OAuth 2.0 browser login)
 
+Download `client_secret.json` from [Google Cloud Console → Credentials](https://console.cloud.google.com/apis/credentials) (Desktop app type).
+
 ```bash
-# Requires GSHEETS_CLIENT_ID and GSHEETS_CLIENT_SECRET env vars
-# Create at: https://console.cloud.google.com/apis/credentials (Desktop app type)
+# Option A: place client_secret.json at the default path (auto-detected)
+#   Linux:  ~/.config/google/client_secret.json
+#   macOS:  ~/Library/Application Support/google/client_secret.json
+gsheets auth login
+
+# Option B: specify the path explicitly
+gsheets auth set-client-secret /path/to/client_secret.json
+gsheets auth login
+
+# Option C: env vars
+export GSHEETS_CLIENT_SECRET_FILE=/path/to/client_secret.json
+gsheets auth login
+
+# Option D: individual env vars
 export GSHEETS_CLIENT_ID=<your-client-id>
 export GSHEETS_CLIENT_SECRET=<your-client-secret>
 gsheets auth login
@@ -72,12 +86,14 @@ Output is **auto-detected**: JSON when stdout is piped, human-readable tables in
 ### auth
 
 ```bash
-gsheets auth login                              # OAuth 2.0 browser login
-gsheets auth login --no-browser                 # OAuth 2.0 manual flow (for VPS/remote)
-gsheets auth set-credentials /path/to/sa.json  # Store service account credentials path
-gsheets auth set-token <token>                  # Save a direct access token
-gsheets auth status                             # Show auth status
-gsheets auth logout                             # Remove stored credentials
+gsheets auth login                                     # OAuth 2.0 browser login
+gsheets auth login --no-browser                        # OAuth 2.0 manual flow (for VPS/remote)
+gsheets auth login --client-secret-file /path/to/f    # Use specific client_secret.json
+gsheets auth set-client-secret /path/to/client_secret.json  # Store client_secret.json path
+gsheets auth set-credentials /path/to/sa.json         # Store service account path
+gsheets auth set-token <token>                         # Save a direct access token
+gsheets auth status                                    # Show auth status
+gsheets auth logout                                    # Remove stored credentials
 ```
 
 ### info

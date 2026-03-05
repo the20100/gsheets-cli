@@ -11,6 +11,8 @@ import (
 type Config struct {
 	// Service account credentials file path (set by: gsheets auth set-credentials).
 	CredentialsFile string `json:"credentials_file,omitempty"`
+	// OAuth 2.0 client_secret.json path (set by: gsheets auth set-client-secret).
+	ClientSecretFile string `json:"client_secret_file,omitempty"`
 	// OAuth 2.0 token fields (set by: gsheets auth login).
 	AccessToken  string `json:"access_token,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
