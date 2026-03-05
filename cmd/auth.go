@@ -1,16 +1,88 @@
 package cmd
 
 import (
+	"bufio"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/the20100/gsheets-cli/internal/config"
 )
 
+const (
+	googleAuthURL  = "https://accounts.google.com/o/oauth2/v2/auth"
+	googleTokenURL = "https://oauth2.googleapis.com/token"
+	googleUserInfo = "https://www.googleapis.com/oauth2/v2/userinfo"
+	sheetsScope    = "https://www.googleapis.com/auth/spreadsheets"
+)
+
 var authCmd = &cobra.Command{
 	Use:   "auth",
 	Short: "Manage Google Sheets authentication",
+}
+
+var authLoginNoBrowser bool
+
+var authLoginCmd = &cobra.Command{
+	Use:   "login",
+	Short: "Log in to Google Sheets via browser OAuth 2.0",
+	Long: `Opens your browser to authenticate with Google and saves the credentials.
+
+Requires GSHEETS_CLIENT_ID and GSHEETS_CLIENT_SECRET environment variables.
+Create OAuth 2.0 credentials at: https://console.cloud.google.com/apis/credentials
+Choose "Desktop application" as the application type.
+Add http://localhost:8080 as an authorized redirect URI.
+
+On a remote server (VPS) where no browser is available:
+  gsheets auth login --no-browser
+
+  This prints the auth URL for you to open locally. After authorizing, your
+  browser will redirect to localhost:8080 (which will fail to load — that's ok).
+  Copy the full URL from the address bar and paste it into the terminal.`,
+	RunE: runAuthLogin,
+}
+
+var authSetTokenCmd = &cobra.Command{
+	Use:   "set-token <access-token>",
+	Short: "Save an access token directly (no browser needed, no auto-refresh)",
+	Long: `Saves a Google Sheets access token directly to the config file.
+
+Note: tokens saved this way cannot be auto-refreshed. To get a long-lived
+setup with automatic token refresh, use: gsheets auth login
+
+You can also set GSHEETS_ACCESS_TOKEN as an env var for one-off use.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		token := args[0]
+		if len(token) < 8 {
+			return fmt.Errorf("token looks too short")
+		}
+		email, name, err := fetchUserInfo(token)
+		if err != nil {
+			return fmt.Errorf("token validation failed: %w", err)
+		}
+		newCfg := &config.Config{
+			AccessToken: token,
+			UserEmail:   email,
+			UserName:    name,
+		}
+		if err := config.Save(newCfg); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+		fmt.Printf("Token saved — authenticated as %s (%s)\n", name, email)
+		fmt.Printf("Config: %s\n", config.Path())
+		return nil
+	},
 }
 
 var authSetCredentialsCmd = &cobra.Command{
@@ -20,21 +92,14 @@ var authSetCredentialsCmd = &cobra.Command{
 
 To create a service account:
   1. Go to https://console.cloud.google.com/iam-admin/serviceaccounts
-  2. Create a service account and grant it access to your spreadsheets
+  2. Create a service account and share your spreadsheets with its email
   3. Create a JSON key and download it
   4. Run: gsheets auth set-credentials /path/to/key.json
 
-Alternatively, set the GOOGLE_APPLICATION_CREDENTIALS env var,
-or use: gcloud auth application-default login (for user credentials).
-
-The path is stored at:
-  macOS:   ~/Library/Application Support/gsheets/config.json
-  Linux:   ~/.config/gsheets/config.json
-  Windows: %AppData%\gsheets\config.json`,
+Alternatively, set the GOOGLE_APPLICATION_CREDENTIALS env var.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		path := args[0]
-		// Verify the file exists
 		if _, err := os.Stat(path); err != nil {
 			return fmt.Errorf("credentials file not found: %s", path)
 		}
@@ -57,23 +122,37 @@ var authStatusCmd = &cobra.Command{
 		}
 		fmt.Printf("Config: %s\n\n", config.Path())
 
-		if v := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); v != "" {
-			fmt.Println("Source: GOOGLE_APPLICATION_CREDENTIALS env var (takes priority)")
-			fmt.Printf("File:   %s\n", v)
-		} else if v := os.Getenv("GSHEETS_CREDENTIALS"); v != "" {
-			fmt.Println("Source: GSHEETS_CREDENTIALS env var")
+		if v := os.Getenv("GSHEETS_ACCESS_TOKEN"); v != "" {
+			fmt.Println("Token source: GSHEETS_ACCESS_TOKEN env var (takes priority over config)")
+			fmt.Printf("Token:        %s\n", maskOrEmpty(v))
+		} else if v := resolveEnv("GOOGLE_APPLICATION_CREDENTIALS", "GSHEETS_CREDENTIALS"); v != "" {
+			fmt.Println("Source: service account credentials file (env var)")
 			fmt.Printf("File:   %s\n", v)
 		} else if c.CredentialsFile != "" {
-			fmt.Println("Source: config file")
+			fmt.Println("Source: service account credentials file (config)")
 			fmt.Printf("File:   %s\n", c.CredentialsFile)
+		} else if c.AccessToken != "" {
+			if c.UserName != "" {
+				fmt.Printf("Authenticated as: %s (%s)\n", c.UserName, c.UserEmail)
+			}
+			fmt.Printf("Token source:     config file (OAuth)\n")
+			fmt.Printf("Token:            %s\n", maskOrEmpty(c.AccessToken))
+			if c.RefreshToken != "" {
+				fmt.Println("Auto-refresh:     enabled")
+			} else {
+				fmt.Println("Auto-refresh:     disabled (no refresh token)")
+			}
+			if c.TokenExpiry > 0 {
+				expiry := time.Unix(c.TokenExpiry, 0)
+				if time.Now().Before(expiry) {
+					fmt.Printf("Token expires:    %s\n", expiry.UTC().Format("2006-01-02 15:04 UTC"))
+				} else {
+					fmt.Printf("Token expires:    expired at %s\n", expiry.UTC().Format("2006-01-02 15:04 UTC"))
+				}
+			}
 		} else {
-			fmt.Println("Source: Application Default Credentials (ADC)")
-			fmt.Println("       (uses GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC)")
-			fmt.Println()
-			fmt.Println("To configure explicitly, run one of:")
-			fmt.Println("  gsheets auth set-credentials /path/to/sa.json")
-			fmt.Println("  export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json")
-			fmt.Println("  gcloud auth application-default login")
+			fmt.Println("Status: not authenticated")
+			fmt.Printf("\nRun: gsheets auth login\nOr:  export GSHEETS_ACCESS_TOKEN=<token>\nOr:  gsheets auth set-credentials /path/to/sa.json\n")
 		}
 		return nil
 	},
@@ -81,17 +160,279 @@ var authStatusCmd = &cobra.Command{
 
 var authLogoutCmd = &cobra.Command{
 	Use:   "logout",
-	Short: "Remove the saved credentials path from the config file",
+	Short: "Remove saved credentials from the config file",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := config.Clear(); err != nil {
 			return fmt.Errorf("removing config: %w", err)
 		}
-		fmt.Println("Credentials path removed from config.")
+		fmt.Println("Credentials removed from config.")
 		return nil
 	},
 }
 
 func init() {
-	authCmd.AddCommand(authSetCredentialsCmd, authStatusCmd, authLogoutCmd)
+	authLoginCmd.Flags().BoolVar(&authLoginNoBrowser, "no-browser", false, "Manual auth flow for remote/VPS: print the URL, prompt for the redirect URL")
+	authCmd.AddCommand(authLoginCmd, authSetTokenCmd, authSetCredentialsCmd, authStatusCmd, authLogoutCmd)
 	rootCmd.AddCommand(authCmd)
+}
+
+func runAuthLogin(cmd *cobra.Command, args []string) error {
+	clientID := os.Getenv("GSHEETS_CLIENT_ID")
+	clientSecret := os.Getenv("GSHEETS_CLIENT_SECRET")
+
+	// Fall back to stored config
+	if clientID == "" || clientSecret == "" {
+		if c, err := config.Load(); err == nil && c != nil {
+			if clientID == "" {
+				clientID = c.ClientID
+			}
+			if clientSecret == "" {
+				clientSecret = c.ClientSecret
+			}
+		}
+	}
+
+	if clientID == "" {
+		return fmt.Errorf("GSHEETS_CLIENT_ID not set\n\nCreate credentials at: https://console.cloud.google.com/apis/credentials\nThen: export GSHEETS_CLIENT_ID=<your-client-id>")
+	}
+	if clientSecret == "" {
+		return fmt.Errorf("GSHEETS_CLIENT_SECRET not set\n\nexport GSHEETS_CLIENT_SECRET=<your-client-secret>")
+	}
+
+	var code string
+	var redirectURI string
+
+	if authLoginNoBrowser {
+		redirectURI = "http://localhost:8080"
+		authURL := buildAuthURL(clientID, redirectURI)
+		var err error
+		code, err = runOAuthFlowManual(authURL)
+		if err != nil {
+			return err
+		}
+	} else {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return fmt.Errorf("finding free port: %w", err)
+		}
+		port := listener.Addr().(*net.TCPAddr).Port
+		redirectURI = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+
+		codeCh := make(chan string, 1)
+		errCh := make(chan error, 1)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query()
+			if errMsg := q.Get("error"); errMsg != "" {
+				errCh <- fmt.Errorf("OAuth error: %s — %s", errMsg, q.Get("error_description"))
+				http.Error(w, "Authentication failed. You may close this tab.", http.StatusBadRequest)
+				return
+			}
+			code := q.Get("code")
+			if code == "" {
+				errCh <- fmt.Errorf("no code returned in callback")
+				http.Error(w, "No code received. You may close this tab.", http.StatusBadRequest)
+				return
+			}
+			codeCh <- code
+			w.Header().Set("Content-Type", "text/html")
+			fmt.Fprint(w, `<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px">
+<h2>Authentication successful!</h2>
+<p>You may close this tab and return to the terminal.</p>
+</body></html>`)
+		})
+
+		srv := &http.Server{Handler: mux}
+		go func() {
+			if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+				select {
+				case errCh <- fmt.Errorf("callback server error: %w", err):
+				default:
+				}
+			}
+		}()
+
+		authURL := buildAuthURL(clientID, redirectURI)
+		fmt.Printf("\nOpening browser for Google authentication...\n")
+		fmt.Printf("If the browser does not open, visit:\n  %s\n\n", authURL)
+		openBrowser(authURL)
+		fmt.Printf("Waiting for callback on http://127.0.0.1:%d/callback ...\n", port)
+
+		select {
+		case code = <-codeCh:
+		case err = <-errCh:
+			shutdownServer(srv)
+			return err
+		case <-time.After(5 * time.Minute):
+			shutdownServer(srv)
+			return fmt.Errorf("timed out waiting for OAuth callback (5 minutes)")
+		}
+		shutdownServer(srv)
+	}
+
+	fmt.Println("Exchanging authorization code for tokens...")
+	accessToken, refreshToken, expiry, err := exchangeCode(code, clientID, clientSecret, redirectURI)
+	if err != nil {
+		return fmt.Errorf("exchanging code: %w", err)
+	}
+
+	fmt.Println("Fetching user info...")
+	email, name, err := fetchUserInfo(accessToken)
+	if err != nil {
+		return fmt.Errorf("fetching user info: %w", err)
+	}
+
+	newCfg := &config.Config{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		TokenExpiry:  expiry,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		UserEmail:    email,
+		UserName:     name,
+	}
+	if err := config.Save(newCfg); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+
+	fmt.Printf("\nAuthenticated as %s (%s)\n", name, email)
+	fmt.Printf("Auto-refresh: enabled\n")
+	fmt.Printf("Config saved to: %s\n", config.Path())
+	return nil
+}
+
+func runOAuthFlowManual(authURL string) (string, error) {
+	fmt.Printf("\nOpen the following URL in your browser:\n\n%s\n\n", authURL)
+	fmt.Println("After authorizing, your browser will be redirected to localhost:8080.")
+	fmt.Println("That page will fail to load — that's expected on a remote server.")
+	fmt.Println("Copy the full URL from the browser's address bar and paste it below.")
+	fmt.Print("\nRedirect URL: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	rawURL, err := reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("reading redirect URL: %w", err)
+	}
+	rawURL = strings.TrimSpace(rawURL)
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("parsing redirect URL: %w", err)
+	}
+
+	if errMsg := parsed.Query().Get("error"); errMsg != "" {
+		return "", fmt.Errorf("authorization failed: %s", errMsg)
+	}
+
+	code := parsed.Query().Get("code")
+	if code == "" {
+		return "", fmt.Errorf("no authorization code found in URL — make sure you copied the full redirect URL")
+	}
+
+	return code, nil
+}
+
+func buildAuthURL(clientID, redirectURI string) string {
+	params := url.Values{}
+	params.Set("client_id", clientID)
+	params.Set("redirect_uri", redirectURI)
+	params.Set("scope", sheetsScope)
+	params.Set("response_type", "code")
+	params.Set("access_type", "offline")
+	params.Set("prompt", "consent")
+	return googleAuthURL + "?" + params.Encode()
+}
+
+func exchangeCode(code, clientID, clientSecret, redirectURI string) (string, string, int64, error) {
+	params := url.Values{}
+	params.Set("code", code)
+	params.Set("client_id", clientID)
+	params.Set("client_secret", clientSecret)
+	params.Set("redirect_uri", redirectURI)
+	params.Set("grant_type", "authorization_code")
+
+	resp, err := http.PostForm(googleTokenURL, params)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("reading token response: %w", err)
+	}
+
+	var result struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
+		Error        string `json:"error"`
+		ErrorDesc    string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", "", 0, fmt.Errorf("parsing token response: %w", err)
+	}
+	if result.Error != "" {
+		return "", "", 0, fmt.Errorf("OAuth error: %s — %s", result.Error, result.ErrorDesc)
+	}
+	if result.AccessToken == "" {
+		return "", "", 0, fmt.Errorf("no access_token in response: %s", string(body))
+	}
+
+	expiry := time.Now().Unix() + result.ExpiresIn
+	return result.AccessToken, result.RefreshToken, expiry, nil
+}
+
+func fetchUserInfo(token string) (email, name string, err error) {
+	req, err := http.NewRequest(http.MethodGet, googleUserInfo, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("userinfo request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("reading userinfo response: %w", err)
+	}
+
+	var result struct {
+		Email string `json:"email"`
+		Name  string `json:"name"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", "", fmt.Errorf("parsing userinfo response: %w", err)
+	}
+	if result.Error != nil {
+		return "", "", fmt.Errorf("userinfo error: %s", result.Error.Message)
+	}
+	return result.Email, result.Name, nil
+}
+
+func openBrowser(u string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", u)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", u)
+	default:
+		cmd = exec.Command("xdg-open", u)
+	}
+	_ = cmd.Start()
+}
+
+func shutdownServer(srv *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
 }

@@ -13,17 +13,17 @@ mv gsheets /usr/local/bin/
 
 ## Authentication
 
-`gsheets` uses Google's standard credential resolution:
+Credentials are resolved in this order:
 
-1. `GOOGLE_APPLICATION_CREDENTIALS` env var (path to service account JSON) — checked first
-2. `GSHEETS_CREDENTIALS` env var (path to service account JSON)
-3. Config file — set with `gsheets auth set-credentials`
-4. Application Default Credentials (ADC) — `gcloud auth application-default login`
+1. `GSHEETS_ACCESS_TOKEN` env var — direct bearer token, no refresh
+2. `GOOGLE_APPLICATION_CREDENTIALS` env var — path to service account JSON
+3. `GSHEETS_CREDENTIALS` env var — path to service account JSON
+4. Config file — set with `gsheets auth login` (OAuth) or `gsheets auth set-credentials` (service account)
 
 ### Service Account (recommended for automation)
 
 1. Go to [Google Cloud Console → Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts)
-2. Create a service account and grant it access to your spreadsheets (share the sheet with the service account email)
+2. Create a service account and share your spreadsheets with its email
 3. Create a JSON key and download it
 4. Configure:
 
@@ -35,10 +35,22 @@ gsheets auth set-credentials /path/to/sa.json
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
 ```
 
-### User Account (interactive)
+### User Account (OAuth 2.0 browser login)
 
 ```bash
-gcloud auth application-default login
+# Requires GSHEETS_CLIENT_ID and GSHEETS_CLIENT_SECRET env vars
+# Create at: https://console.cloud.google.com/apis/credentials (Desktop app type)
+export GSHEETS_CLIENT_ID=<your-client-id>
+export GSHEETS_CLIENT_SECRET=<your-client-secret>
+gsheets auth login
+```
+
+### Direct Token
+
+```bash
+export GSHEETS_ACCESS_TOKEN=<your-access-token>
+# Or save permanently:
+gsheets auth set-token <your-access-token>
 ```
 
 ## Usage
@@ -60,9 +72,12 @@ Output is **auto-detected**: JSON when stdout is piped, human-readable tables in
 ### auth
 
 ```bash
-gsheets auth set-credentials /path/to/sa.json  # Store credentials path
+gsheets auth login                              # OAuth 2.0 browser login
+gsheets auth login --no-browser                 # OAuth 2.0 manual flow (for VPS/remote)
+gsheets auth set-credentials /path/to/sa.json  # Store service account credentials path
+gsheets auth set-token <token>                  # Save a direct access token
 gsheets auth status                             # Show auth status
-gsheets auth logout                             # Remove stored path
+gsheets auth logout                             # Remove stored credentials
 ```
 
 ### info

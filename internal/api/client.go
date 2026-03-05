@@ -1,144 +1,234 @@
 package api
 
 import (
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
-
-	"google.golang.org/api/option"
-	"google.golang.org/api/sheets/v4"
+	"io"
+	"net/http"
+	"net/url"
+	"time"
 )
 
-// Client wraps the official Google Sheets API service.
+const apiBase = "https://sheets.googleapis.com/v4/spreadsheets"
+
+// RefreshFunc is called when the access token is expired.
+// It returns the new access token and its Unix expiry timestamp.
+type RefreshFunc func() (newToken string, expiresAt int64, err error)
+
+// Client is an authenticated Google Sheets API v4 client.
 type Client struct {
-	srv *sheets.Service
+	token       string
+	tokenExpiry int64
+	refreshFn   RefreshFunc
+	httpClient  *http.Client
 }
 
-// NewClient creates a new Sheets client.
-// If credentialsFile is empty, it uses Application Default Credentials
-// (GOOGLE_APPLICATION_CREDENTIALS env var or gcloud ADC).
-func NewClient(credentialsFile string) (*Client, error) {
-	ctx := context.Background()
-	opts := []option.ClientOption{}
-	if credentialsFile != "" {
-		opts = append(opts, option.WithCredentialsFile(credentialsFile))
+// NewClient creates an authenticated Client.
+// refreshFn may be nil if no token refresh is needed.
+func NewClient(token string, tokenExpiry int64, refreshFn RefreshFunc) *Client {
+	return &Client{
+		token:       token,
+		tokenExpiry: tokenExpiry,
+		refreshFn:   refreshFn,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}
-	srv, err := sheets.NewService(ctx, opts...)
+}
+
+// ensureToken refreshes the access token if it expires within 60 seconds.
+func (c *Client) ensureToken() error {
+	if c.refreshFn == nil {
+		return nil
+	}
+	if c.tokenExpiry > 0 && time.Now().Unix() < c.tokenExpiry-60 {
+		return nil
+	}
+	newToken, expiresAt, err := c.refreshFn()
 	if err != nil {
-		return nil, fmt.Errorf("creating sheets service: %w", err)
+		return fmt.Errorf("refreshing token: %w", err)
 	}
-	return &Client{srv: srv}, nil
+	c.token = newToken
+	c.tokenExpiry = expiresAt
+	return nil
+}
+
+func (c *Client) do(method, rawURL string, params url.Values, body any) ([]byte, error) {
+	if err := c.ensureToken(); err != nil {
+		return nil, err
+	}
+	if params != nil {
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, err
+		}
+		u.RawQuery = params.Encode()
+		rawURL = u.String()
+	}
+	var bodyReader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("encoding request: %w", err)
+		}
+		bodyReader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, rawURL, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		var errResp struct {
+			Error struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if jerr := json.Unmarshal(respBody, &errResp); jerr == nil && errResp.Error.Message != "" {
+			return nil, &SheetsError{
+				StatusCode: resp.StatusCode,
+				Message:    fmt.Sprintf("API error %d: %s", errResp.Error.Code, errResp.Error.Message),
+			}
+		}
+		return nil, &SheetsError{
+			StatusCode: resp.StatusCode,
+			Message:    fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(respBody)),
+		}
+	}
+	return respBody, nil
 }
 
 // ---- Spreadsheet methods ----
 
-// GetSpreadsheet retrieves spreadsheet metadata.
 func (c *Client) GetSpreadsheet(id string) (*SpreadsheetInfo, error) {
-	resp, err := c.srv.Spreadsheets.Get(id).Do()
+	u := apiBase + "/" + url.PathEscape(id)
+	body, err := c.do("GET", u, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	return spreadsheetToInfo(resp), nil
+	return parseSpreadsheet(body)
 }
 
-// CreateSpreadsheet creates a new spreadsheet with the given title.
 func (c *Client) CreateSpreadsheet(title string) (*SpreadsheetInfo, error) {
-	resp, err := c.srv.Spreadsheets.Create(&sheets.Spreadsheet{
-		Properties: &sheets.SpreadsheetProperties{
-			Title: title,
-		},
-	}).Do()
+	payload := map[string]interface{}{
+		"properties": map[string]string{"title": title},
+	}
+	body, err := c.do("POST", apiBase, nil, payload)
 	if err != nil {
 		return nil, err
 	}
-	return spreadsheetToInfo(resp), nil
+	return parseSpreadsheet(body)
 }
 
 // ---- Sheet methods ----
 
-// ListSheets returns all sheets/tabs in a spreadsheet.
 func (c *Client) ListSheets(spreadsheetID string) ([]SheetInfo, error) {
-	resp, err := c.srv.Spreadsheets.Get(spreadsheetID).Do()
+	info, err := c.GetSpreadsheet(spreadsheetID)
 	if err != nil {
 		return nil, err
 	}
-	return spreadsheetToInfo(resp).Sheets, nil
+	return info.Sheets, nil
 }
 
-// AddSheet adds a new sheet/tab to a spreadsheet.
-// index < 0 means append at the end.
 func (c *Client) AddSheet(spreadsheetID, title string, index int) (*SheetInfo, error) {
-	addReq := &sheets.AddSheetRequest{
-		Properties: &sheets.SheetProperties{
-			Title: title,
-		},
-	}
+	props := map[string]interface{}{"title": title}
 	if index >= 0 {
-		addReq.Properties.Index = int64(index)
+		props["index"] = index
 	}
-	req := &sheets.BatchUpdateSpreadsheetRequest{
-		Requests: []*sheets.Request{
-			{AddSheet: addReq},
+	payload := map[string]interface{}{
+		"requests": []map[string]interface{}{
+			{"addSheet": map[string]interface{}{"properties": props}},
 		},
 	}
-	resp, err := c.srv.Spreadsheets.BatchUpdate(spreadsheetID, req).Do()
+	u := apiBase + "/" + url.PathEscape(spreadsheetID) + ":batchUpdate"
+	body, err := c.do("POST", u, nil, payload)
 	if err != nil {
 		return nil, err
+	}
+	var resp struct {
+		Replies []struct {
+			AddSheet *struct {
+				Properties sheetProperties `json:"properties"`
+			} `json:"addSheet"`
+		} `json:"replies"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
 	}
 	for _, reply := range resp.Replies {
 		if reply.AddSheet != nil {
-			info := sheetToInfo(reply.AddSheet.Properties)
-			return &info, nil
+			si := propsToSheetInfo(reply.AddSheet.Properties)
+			return &si, nil
 		}
 	}
-	return nil, fmt.Errorf("unexpected response: no AddSheet reply")
+	return nil, fmt.Errorf("unexpected response: no addSheet reply")
 }
 
-// DeleteSheet deletes a sheet by its numeric sheet ID.
 func (c *Client) DeleteSheet(spreadsheetID string, sheetID int64) error {
-	req := &sheets.BatchUpdateSpreadsheetRequest{
-		Requests: []*sheets.Request{
-			{DeleteSheet: &sheets.DeleteSheetRequest{SheetId: sheetID}},
+	payload := map[string]interface{}{
+		"requests": []map[string]interface{}{
+			{"deleteSheet": map[string]interface{}{"sheetId": sheetID}},
 		},
 	}
-	_, err := c.srv.Spreadsheets.BatchUpdate(spreadsheetID, req).Do()
+	u := apiBase + "/" + url.PathEscape(spreadsheetID) + ":batchUpdate"
+	_, err := c.do("POST", u, nil, payload)
 	return err
 }
 
-// RenameSheet renames a sheet by its numeric sheet ID.
 func (c *Client) RenameSheet(spreadsheetID string, sheetID int64, newTitle string) error {
-	req := &sheets.BatchUpdateSpreadsheetRequest{
-		Requests: []*sheets.Request{
+	payload := map[string]interface{}{
+		"requests": []map[string]interface{}{
 			{
-				UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
-					Properties: &sheets.SheetProperties{
-						SheetId: sheetID,
-						Title:   newTitle,
+				"updateSheetProperties": map[string]interface{}{
+					"properties": map[string]interface{}{
+						"sheetId": sheetID,
+						"title":   newTitle,
 					},
-					Fields: "title",
+					"fields": "title",
 				},
 			},
 		},
 	}
-	_, err := c.srv.Spreadsheets.BatchUpdate(spreadsheetID, req).Do()
+	u := apiBase + "/" + url.PathEscape(spreadsheetID) + ":batchUpdate"
+	_, err := c.do("POST", u, nil, payload)
 	return err
 }
 
 // ---- Values methods ----
 
-// GetValues reads values from a range.
-// renderOption: FORMATTED_VALUE (default), UNFORMATTED_VALUE, FORMULA
-// dimension: ROWS (default), COLUMNS
 func (c *Client) GetValues(spreadsheetID, rangeStr, renderOption, dimension string) (*ValuesResult, error) {
-	call := c.srv.Spreadsheets.Values.Get(spreadsheetID, rangeStr)
+	u := apiBase + "/" + url.PathEscape(spreadsheetID) + "/values/" + url.PathEscape(rangeStr)
+	params := url.Values{}
 	if renderOption != "" {
-		call = call.ValueRenderOption(renderOption)
+		params.Set("valueRenderOption", renderOption)
 	}
 	if dimension != "" {
-		call = call.MajorDimension(dimension)
+		params.Set("majorDimension", dimension)
 	}
-	resp, err := call.Do()
+	body, err := c.do("GET", u, params, nil)
 	if err != nil {
 		return nil, err
+	}
+	var resp struct {
+		Range          string          `json:"range"`
+		MajorDimension string          `json:"majorDimension"`
+		Values         [][]interface{} `json:"values"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
 	}
 	return &ValuesResult{
 		Range:     resp.Range,
@@ -147,22 +237,30 @@ func (c *Client) GetValues(spreadsheetID, rangeStr, renderOption, dimension stri
 	}, nil
 }
 
-// UpdateValues writes values to a range.
-// inputOption: USER_ENTERED (default), RAW
 func (c *Client) UpdateValues(spreadsheetID, rangeStr string, values [][]interface{}, inputOption string) (*UpdateResult, error) {
 	if inputOption == "" {
 		inputOption = "USER_ENTERED"
 	}
-	vr := &sheets.ValueRange{
-		Values: values,
-	}
-	resp, err := c.srv.Spreadsheets.Values.Update(spreadsheetID, rangeStr, vr).
-		ValueInputOption(inputOption).Do()
+	u := apiBase + "/" + url.PathEscape(spreadsheetID) + "/values/" + url.PathEscape(rangeStr)
+	params := url.Values{}
+	params.Set("valueInputOption", inputOption)
+	payload := map[string]interface{}{"values": values}
+	body, err := c.do("PUT", u, params, payload)
 	if err != nil {
 		return nil, err
 	}
+	var resp struct {
+		SpreadsheetID  string `json:"spreadsheetId"`
+		UpdatedRange   string `json:"updatedRange"`
+		UpdatedRows    int64  `json:"updatedRows"`
+		UpdatedColumns int64  `json:"updatedColumns"`
+		UpdatedCells   int64  `json:"updatedCells"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
 	return &UpdateResult{
-		SpreadsheetID:  resp.SpreadsheetId,
+		SpreadsheetID:  resp.SpreadsheetID,
 		UpdatedRange:   resp.UpdatedRange,
 		UpdatedRows:    resp.UpdatedRows,
 		UpdatedColumns: resp.UpdatedColumns,
@@ -170,9 +268,6 @@ func (c *Client) UpdateValues(spreadsheetID, rangeStr string, values [][]interfa
 	}, nil
 }
 
-// AppendValues appends values after the last row in a range.
-// inputOption: USER_ENTERED (default), RAW
-// insertOption: INSERT_ROWS (default), OVERWRITE
 func (c *Client) AppendValues(spreadsheetID, rangeStr string, values [][]interface{}, inputOption, insertOption string) (*UpdateResult, error) {
 	if inputOption == "" {
 		inputOption = "USER_ENTERED"
@@ -180,16 +275,28 @@ func (c *Client) AppendValues(spreadsheetID, rangeStr string, values [][]interfa
 	if insertOption == "" {
 		insertOption = "INSERT_ROWS"
 	}
-	vr := &sheets.ValueRange{
-		Values: values,
-	}
-	resp, err := c.srv.Spreadsheets.Values.Append(spreadsheetID, rangeStr, vr).
-		ValueInputOption(inputOption).
-		InsertDataOption(insertOption).Do()
+	u := apiBase + "/" + url.PathEscape(spreadsheetID) + "/values/" + url.PathEscape(rangeStr) + ":append"
+	params := url.Values{}
+	params.Set("valueInputOption", inputOption)
+	params.Set("insertDataOption", insertOption)
+	payload := map[string]interface{}{"values": values}
+	body, err := c.do("POST", u, params, payload)
 	if err != nil {
 		return nil, err
 	}
-	result := &UpdateResult{SpreadsheetID: resp.SpreadsheetId}
+	var resp struct {
+		SpreadsheetID string `json:"spreadsheetId"`
+		Updates       *struct {
+			UpdatedRange   string `json:"updatedRange"`
+			UpdatedRows    int64  `json:"updatedRows"`
+			UpdatedColumns int64  `json:"updatedColumns"`
+			UpdatedCells   int64  `json:"updatedCells"`
+		} `json:"updates"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+	result := &UpdateResult{SpreadsheetID: resp.SpreadsheetID}
 	if resp.Updates != nil {
 		result.UpdatedRange = resp.Updates.UpdatedRange
 		result.UpdatedRows = resp.Updates.UpdatedRows
@@ -199,39 +306,69 @@ func (c *Client) AppendValues(spreadsheetID, rangeStr string, values [][]interfa
 	return result, nil
 }
 
-// ClearValues clears values in a range (preserves formatting).
 func (c *Client) ClearValues(spreadsheetID, rangeStr string) (string, error) {
-	resp, err := c.srv.Spreadsheets.Values.Clear(spreadsheetID, rangeStr, &sheets.ClearValuesRequest{}).Do()
+	u := apiBase + "/" + url.PathEscape(spreadsheetID) + "/values/" + url.PathEscape(rangeStr) + ":clear"
+	body, err := c.do("POST", u, nil, map[string]interface{}{})
 	if err != nil {
 		return "", err
+	}
+	var resp struct {
+		ClearedRange string `json:"clearedRange"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("parsing response: %w", err)
 	}
 	return resp.ClearedRange, nil
 }
 
 // ---- helpers ----
 
-func spreadsheetToInfo(s *sheets.Spreadsheet) *SpreadsheetInfo {
-	info := &SpreadsheetInfo{
-		ID:    s.SpreadsheetId,
-		Title: s.Properties.Title,
-		URL:   s.SpreadsheetUrl,
-	}
-	for _, sh := range s.Sheets {
-		info.Sheets = append(info.Sheets, sheetToInfo(sh.Properties))
-	}
-	return info
+type sheetProperties struct {
+	SheetID        int64  `json:"sheetId"`
+	Title          string `json:"title"`
+	Index          int64  `json:"index"`
+	SheetType      string `json:"sheetType"`
+	GridProperties *struct {
+		RowCount    int64 `json:"rowCount"`
+		ColumnCount int64 `json:"columnCount"`
+	} `json:"gridProperties"`
 }
 
-func sheetToInfo(p *sheets.SheetProperties) SheetInfo {
-	info := SheetInfo{
-		ID:    p.SheetId,
+func propsToSheetInfo(p sheetProperties) SheetInfo {
+	si := SheetInfo{
+		ID:    p.SheetID,
 		Title: p.Title,
 		Index: p.Index,
 		Type:  p.SheetType,
 	}
 	if p.GridProperties != nil {
-		info.Rows = p.GridProperties.RowCount
-		info.Cols = p.GridProperties.ColumnCount
+		si.Rows = p.GridProperties.RowCount
+		si.Cols = p.GridProperties.ColumnCount
 	}
-	return info
+	return si
+}
+
+func parseSpreadsheet(data []byte) (*SpreadsheetInfo, error) {
+	var resp struct {
+		SpreadsheetID  string `json:"spreadsheetId"`
+		SpreadsheetURL string `json:"spreadsheetUrl"`
+		Properties     struct {
+			Title string `json:"title"`
+		} `json:"properties"`
+		Sheets []struct {
+			Properties sheetProperties `json:"properties"`
+		} `json:"sheets"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+	info := &SpreadsheetInfo{
+		ID:    resp.SpreadsheetID,
+		Title: resp.Properties.Title,
+		URL:   resp.SpreadsheetURL,
+	}
+	for _, sh := range resp.Sheets {
+		info.Sheets = append(info.Sheets, propsToSheetInfo(sh.Properties))
+	}
+	return info, nil
 }

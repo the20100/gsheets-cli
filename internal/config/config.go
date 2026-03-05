@@ -9,7 +9,16 @@ import (
 
 // Config holds the persisted user configuration.
 type Config struct {
-	CredentialsFile string `json:"credentials_file"`
+	// Service account credentials file path (set by: gsheets auth set-credentials).
+	CredentialsFile string `json:"credentials_file,omitempty"`
+	// OAuth 2.0 token fields (set by: gsheets auth login).
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	TokenExpiry  int64  `json:"token_expiry,omitempty"`
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	UserEmail    string `json:"user_email,omitempty"`
+	UserName     string `json:"user_name,omitempty"`
 }
 
 func configPath() (string, error) {
