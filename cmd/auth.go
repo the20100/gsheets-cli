@@ -25,6 +25,8 @@ const (
 	googleTokenURL = "https://oauth2.googleapis.com/token"
 	googleUserInfo = "https://www.googleapis.com/oauth2/v2/userinfo"
 	sheetsScope    = "https://www.googleapis.com/auth/spreadsheets"
+	// oauthLoginScope adds userinfo scopes so we can display who is logged in.
+	oauthLoginScope = sheetsScope + " https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile"
 )
 
 var authCmd = &cobra.Command{
@@ -486,7 +488,7 @@ func buildAuthURL(clientID, redirectURI string) string {
 	params := url.Values{}
 	params.Set("client_id", clientID)
 	params.Set("redirect_uri", redirectURI)
-	params.Set("scope", sheetsScope)
+	params.Set("scope", oauthLoginScope)
 	params.Set("response_type", "code")
 	params.Set("access_type", "offline")
 	params.Set("prompt", "consent")
