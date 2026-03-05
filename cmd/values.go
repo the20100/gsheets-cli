@@ -205,4 +205,73 @@ func init() {
 
 	valuesCmd.AddCommand(valuesGetCmd, valuesUpdateCmd, valuesAppendCmd, valuesClearCmd)
 	rootCmd.AddCommand(valuesCmd)
+
+	RegisterSchema("values.get", SchemaEntry{
+		Command:     "gsheets values get <spreadsheet-id> <range>",
+		Description: "Read values from a range (A1 notation)",
+		Args: []SchemaArg{
+			{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"},
+			{Name: "range", Required: true, Desc: "A1 notation range, e.g. Sheet1!A1:C10"},
+		},
+		Flags: []SchemaFlag{
+			{Name: "--render", Type: "string", Default: "FORMATTED_VALUE", Desc: "FORMATTED_VALUE, UNFORMATTED_VALUE, or FORMULA"},
+			{Name: "--dimension", Type: "string", Default: "ROWS", Desc: "Major dimension: ROWS or COLUMNS"},
+			{Name: "--header", Type: "bool", Desc: "Use first row as column headers in table output"},
+			{Name: "--json", Type: "bool", Desc: "Force JSON output"},
+		},
+		Examples: []string{
+			`gsheets values get SPREADSHEET_ID "Sheet1!A1:D10"`,
+			`gsheets values get SPREADSHEET_ID "Sheet1!A1:D10" --header`,
+			`gsheets values get SPREADSHEET_ID "Sheet1!A1:D10" --json`,
+		},
+		Mutating: false,
+	})
+	RegisterSchema("values.update", SchemaEntry{
+		Command:     "gsheets values update <spreadsheet-id> <range>",
+		Description: "Write values to a range",
+		Args: []SchemaArg{
+			{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"},
+			{Name: "range", Required: true, Desc: "A1 notation range starting cell, e.g. Sheet1!A1"},
+		},
+		Flags: []SchemaFlag{
+			{Name: "--row", Type: "string[]", Required: true, Desc: "Comma-separated row values (repeatable for multiple rows)"},
+			{Name: "--input", Type: "string", Default: "USER_ENTERED", Desc: "USER_ENTERED (interprets values) or RAW (literal)"},
+			{Name: "--json", Type: "bool", Desc: "Force JSON output"},
+		},
+		Examples: []string{
+			`gsheets values update SPREADSHEET_ID "Sheet1!A1" --row "Hello"`,
+			`gsheets values update SPREADSHEET_ID "Sheet1!A1:C1" --row "Name,Age,City"`,
+			`gsheets values update SPREADSHEET_ID "Sheet1!A2" --row "Alice,30,NY" --row "Bob,25,SF"`,
+		},
+		Mutating: true,
+	})
+	RegisterSchema("values.append", SchemaEntry{
+		Command:     "gsheets values append <spreadsheet-id> <range>",
+		Description: "Append rows after the last row in a range",
+		Args: []SchemaArg{
+			{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"},
+			{Name: "range", Required: true, Desc: "A1 notation range to append to, e.g. Sheet1!A:C"},
+		},
+		Flags: []SchemaFlag{
+			{Name: "--row", Type: "string[]", Required: true, Desc: "Comma-separated row values (repeatable)"},
+			{Name: "--input", Type: "string", Default: "USER_ENTERED", Desc: "USER_ENTERED or RAW"},
+			{Name: "--insert", Type: "string", Default: "INSERT_ROWS", Desc: "INSERT_ROWS or OVERWRITE"},
+		},
+		Examples: []string{
+			`gsheets values append SPREADSHEET_ID "Sheet1!A:C" --row "Alice,30,Engineer"`,
+		},
+		Mutating: true,
+	})
+	RegisterSchema("values.clear", SchemaEntry{
+		Command:     "gsheets values clear <spreadsheet-id> <range>",
+		Description: "Clear values in a range (preserves formatting)",
+		Args: []SchemaArg{
+			{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"},
+			{Name: "range", Required: true, Desc: "A1 notation range to clear"},
+		},
+		Examples: []string{
+			`gsheets values clear SPREADSHEET_ID "Sheet1!A1:D10"`,
+		},
+		Mutating: true,
+	})
 }

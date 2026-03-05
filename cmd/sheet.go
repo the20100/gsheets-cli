@@ -146,4 +146,53 @@ func init() {
 
 	sheetCmd.AddCommand(sheetListCmd, sheetAddCmd, sheetDeleteCmd, sheetRenameCmd)
 	rootCmd.AddCommand(sheetCmd)
+
+	RegisterSchema("sheet.list", SchemaEntry{
+		Command:     "gsheets sheet list <spreadsheet-id>",
+		Description: "List all sheets/tabs in a spreadsheet",
+		Args:        []SchemaArg{{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"}},
+		Flags: []SchemaFlag{
+			{Name: "--json", Type: "bool", Desc: "Force JSON output"},
+		},
+		Examples: []string{"gsheets sheet list 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"},
+		Mutating: false,
+	})
+	RegisterSchema("sheet.add", SchemaEntry{
+		Command:     "gsheets sheet add <spreadsheet-id> <title>",
+		Description: "Add a new sheet/tab to a spreadsheet",
+		Args: []SchemaArg{
+			{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"},
+			{Name: "title", Required: true, Desc: "Title for the new sheet"},
+		},
+		Flags: []SchemaFlag{
+			{Name: "--index", Type: "int", Default: "-1", Desc: "Position of the new sheet (0-based, default: append)"},
+			{Name: "--json", Type: "bool", Desc: "Force JSON output"},
+		},
+		Examples: []string{
+			`gsheets sheet add SPREADSHEET_ID "Q1 Data"`,
+			`gsheets sheet add SPREADSHEET_ID "Summary" --index 0`,
+		},
+		Mutating: true,
+	})
+	RegisterSchema("sheet.delete", SchemaEntry{
+		Command:     "gsheets sheet delete <spreadsheet-id> <sheet-id>",
+		Description: "Delete a sheet/tab by its numeric sheet ID (WARNING: permanent)",
+		Args: []SchemaArg{
+			{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"},
+			{Name: "sheet-id", Required: true, Desc: "Numeric sheet ID (from sheet.list)"},
+		},
+		Examples: []string{"gsheets sheet delete SPREADSHEET_ID 1234567890"},
+		Mutating: true,
+	})
+	RegisterSchema("sheet.rename", SchemaEntry{
+		Command:     "gsheets sheet rename <spreadsheet-id> <sheet-id> <new-title>",
+		Description: "Rename a sheet/tab",
+		Args: []SchemaArg{
+			{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID"},
+			{Name: "sheet-id", Required: true, Desc: "Numeric sheet ID (from sheet.list)"},
+			{Name: "new-title", Required: true, Desc: "New title for the sheet"},
+		},
+		Examples: []string{`gsheets sheet rename SPREADSHEET_ID 1234567890 "January"`},
+		Mutating: true,
+	})
 }

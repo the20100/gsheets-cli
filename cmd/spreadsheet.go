@@ -91,4 +91,32 @@ Examples:
 func init() {
 	spreadsheetCmd.AddCommand(spreadsheetGetCmd, spreadsheetCreateCmd)
 	rootCmd.AddCommand(spreadsheetCmd)
+
+	RegisterSchema("spreadsheet.get", SchemaEntry{
+		Command:     "gsheets spreadsheet get <spreadsheet-id>",
+		Description: "Get spreadsheet metadata (title, sheets, URL)",
+		Args:        []SchemaArg{{Name: "spreadsheet-id", Required: true, Desc: "The spreadsheet ID from the URL"}},
+		Flags: []SchemaFlag{
+			{Name: "--json", Type: "bool", Desc: "Force JSON output"},
+			{Name: "--pretty", Type: "bool", Desc: "Force pretty-printed JSON output"},
+		},
+		Examples: []string{
+			"gsheets spreadsheet get 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+			"gsheets spreadsheet get 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms --json",
+		},
+		Mutating: false,
+	})
+	RegisterSchema("spreadsheet.create", SchemaEntry{
+		Command:     "gsheets spreadsheet create <title>",
+		Description: "Create a new Google Spreadsheet",
+		Args:        []SchemaArg{{Name: "title", Required: true, Desc: "Title of the new spreadsheet"}},
+		Flags: []SchemaFlag{
+			{Name: "--json", Type: "bool", Desc: "Force JSON output"},
+		},
+		Examples: []string{
+			`gsheets spreadsheet create "My Budget 2026"`,
+			`gsheets spreadsheet create "Sales Data" --json`,
+		},
+		Mutating: true,
+	})
 }

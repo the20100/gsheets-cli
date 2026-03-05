@@ -51,7 +51,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&prettyFlag, "pretty", false, "Force pretty-printed JSON output (implies --json)")
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-		if isAuthCommand(cmd) || cmd.Name() == "info" || cmd.Name() == "update" {
+		if isAuthCommand(cmd) || cmd.Name() == "info" || cmd.Name() == "update" || cmd.Name() == "schema" {
 			return nil
 		}
 		credsFile, err := resolveCredentials()

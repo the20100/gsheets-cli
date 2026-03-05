@@ -5,8 +5,8 @@ A CLI tool for the Google Sheets API. Reads and writes spreadsheet data, manages
 ## Install
 
 ```bash
-git clone https://github.com/the20100/g-sheets-cli
-cd g-sheets-cli
+git clone https://github.com/the20100/gsheets-cli
+cd gsheets-cli
 go build -o gsheets .
 mv gsheets /usr/local/bin/
 ```
@@ -121,6 +121,16 @@ gsheets values append SPREADSHEET_ID "Sheet1!A:C" \
 
 # Clear values (preserves formatting)
 gsheets values clear SPREADSHEET_ID "Sheet1!A1:D10"
+```
+
+### schema
+
+Dump machine-readable command schemas for agent introspection:
+
+```bash
+gsheets schema                      # all commands as JSON
+gsheets schema values.update        # single command schema
+gsheets schema spreadsheet.get
 ```
 
 ### update
