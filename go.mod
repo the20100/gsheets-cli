@@ -2,8 +2,6 @@ module github.com/the20100/gsheets-cli
 
 go 1.25
 
-toolchain go1.25.3
-
 require (
 	github.com/mattn/go-isatty v0.0.20
 	github.com/spf13/cobra v1.8.1
